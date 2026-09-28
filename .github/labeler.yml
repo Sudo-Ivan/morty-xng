@@ -1,0 +1,38 @@
+ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
+          - 'Makefile'
+docs:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.md'
+          - 'morty.1'
+sanitizer:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'sanitize.go'
+          - 'contenttype/**'
+          - 'morty_test.go'
+          - 'fuzz_test.go'
+          - 'contenttype/fuzz_test.go'
+network:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'dial.go'
+          - 'morty.go'
+tests:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*_test.go'
+          - 'scripts/smoke.sh'
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'go.mod'
+          - 'go.sum'
+container:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'Dockerfile'
+          - '.dockerignore'

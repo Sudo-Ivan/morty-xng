@@ -1,3 +1,25 @@
+# v0.4.1 - 2026.09.28
+
+Bug fixes found by a new adversarial test suite, plus performance work.
+
+- fix: .onion targets with an explicit port bypassed the exit page
+- fix: merged query parameters could corrupt the args buffer (aliasing)
+- fix: decompressed upstream bodies now have a hard 64MB cap against
+  decompression bombs
+- fix: CSS expression(), behavior:, binding: and -moz-binding vectors are
+  dropped, closing a legacy IE script-execution path
+- fix: dialer returned a malformed error when every resolved IP was
+  filtered
+- fix: a zero rate limit no longer produces an always-denying limiter
+- perf: HTML sanitizer rewritten for ~2.5x throughput and 33 percent fewer
+  allocations (streamed attributes, lazy escaping, precomputed HMAC pads)
+- test: adversarial suite covering hostile HTML, URI, CSS, HMAC and
+  request-merging cases; concurrent request race test; goleak leak test;
+  oversized body and onion+port regressions; benchmark suite for the
+  sanitizer and HMAC paths
+- ci: issue templates, stale workflow, PR labeler, security policy,
+  contributing guide, codeowners and a Makefile smoke test
+
 # v0.4.0 - 2026.09.28
 
 Hardening and feature release.

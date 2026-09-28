@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/Sudo-Ivan/morty-xng/actions/workflows/ci.yml/badge.svg)](https://github.com/Sudo-Ivan/morty-xng/actions/workflows/ci.yml)
 [![Docker](https://github.com/Sudo-Ivan/morty-xng/actions/workflows/docker.yml/badge.svg)](https://github.com/Sudo-Ivan/morty-xng/actions/workflows/docker.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/Sudo-Ivan/morty-xng)](https://goreportcard.com/report/github.com/Sudo-Ivan/morty-xng)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
 Web content sanitizer proxy as a service.

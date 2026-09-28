@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Sudo-Ivan/morty-xng/security/advisories/new
+    about: Report a security issue privately via a GitHub security advisory.
+  - name: SearXNG compatibility
+    url: https://github.com/Sudo-Ivan/morty-xng#searxng-integration
+    about: Read the SearXNG integration notes before filing an issue about result_proxy.

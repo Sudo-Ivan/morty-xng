@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a defect in morty
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please do not include secrets, real keys, or
+        private URLs in this report.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+      placeholder: When I request ..., morty returns ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Command line, configuration, and a URL or page that triggers the issue.
+      placeholder: |
+        1. Run `morty -listen ...`
+        2. Open `http://127.0.0.1:3000/?mortyurl=...`
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Output of morty with debug enabled (redact keys and private URLs).
+      render: text
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Morty version
+      description: Output of `morty -version` or the container image tag.
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How do you run morty?
+      options:
+        - Container (podman/docker)
+        - Binary / go run
+        - Other
+    validations:
+      required: true

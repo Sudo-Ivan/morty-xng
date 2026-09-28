@@ -1,0 +1,44 @@
+name: Stale
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    name: Mark and close stale issues and PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write # needed to mark, comment on and close stale issues
+      pull-requests: write # needed to mark, comment on and close stale PRs
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@5c7944e73c4c2a096b17a9cb74d65b6c2bbafbde # v2.9.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/stale@5bef64f19d7facfb25b37b414482c7164d639639 # v9.1.0
+        with:
+          stale-issue-message: |
+            This issue has been marked stale because it has been open for 60
+            days with no activity. It will be closed in 14 days if there is
+            no update.
+          stale-pr-message: |
+            This pull request has been marked stale because it has been open
+            for 60 days with no activity. It will be closed in 14 days if
+            there is no update.
+          stale-issue-label: stale
+          stale-pr-label: stale
+          days-before-stale: 60
+          days-before-close: 14
+          exempt-issue-labels: 'pinned,security,bug'
+          exempt-pr-labels: 'pinned,security,work-in-progress'
+          operations-per-run: 60
