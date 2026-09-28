@@ -1,0 +1,35 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - gosec
+    - govet
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # Writes into io.Writer sinks (response buffers) are best-effort:
+      # a failed write cannot be recovered inside the sanitizer.
+      exclude-functions:
+        - fmt.Fprintf
+        - io.WriteString
+        - (io.Writer).Write
+        - (*github.com/valyala/fasthttp.RequestCtx).Write
+    gosec:
+      # G104 duplicates errcheck, which is configured above to ignore
+      # best-effort writes into response buffers.
+      excludes:
+        - G104
+
+exclusions:
+  generated: lax
+  presets:
+    - comments
+    - common-false-positives
+    - legacy
+    - std-error-handling
+  paths:
+    - third_party$
+    - builtin$
+    - examples$
