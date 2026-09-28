@@ -3,6 +3,7 @@ package contenttype
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"testing"
 )
 
@@ -252,9 +253,7 @@ func TestFilterParameters(t *testing.T) {
 	for _, testCase := range filterParametersTestCases {
 		// copy Input since the map will be modified
 		InputCopy := make(map[string]string)
-		for k, v := range testCase.Input {
-			InputCopy[k] = v
-		}
+		maps.Copy(InputCopy, testCase.Input)
 		// apply filter
 		contentType := ContentType{"", "", "", InputCopy}
 		contentType.FilterParameters(testCase.Filter)
