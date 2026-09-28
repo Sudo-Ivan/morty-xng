@@ -19,12 +19,13 @@ jobs:
   image:
     name: Build container image
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write # needed to push the image to ghcr.io on non-PR events
       attestations: write # needed for build provenance attestation
       id-token: write # needed for attestation signing
+      security-events: write # needed to upload grype sarif to code scanning
     steps:
       - name: Harden the runner
         uses: step-security/harden-runner@5c7944e73c4c2a096b17a9cb74d65b6c2bbafbde # v2.9.1
@@ -103,3 +104,96 @@ jobs:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign image (keyless)
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE_REF"
+
+      - name: Install syft and grype
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          for tool in syft:1.52.0 grype:0.119.0; do
+            name="${tool%%:*}"
+            ver="${tool##*:}"
+            base="https://github.com/anchore/${name}/releases/download/v${ver}"
+            curl -fsSLo "/tmp/${name}.tar.gz" "${base}/${name}_${ver}_linux_amd64.tar.gz"
+            curl -fsSLo "/tmp/${name}_checksums.txt" "${base}/${name}_${ver}_checksums.txt"
+            expected=$(awk -v f="${name}_${ver}_linux_amd64.tar.gz" '$2 == f {print $1}' "/tmp/${name}_checksums.txt")
+            actual=$(sha256sum "/tmp/${name}.tar.gz" | awk '{print $1}')
+            [ "$expected" = "$actual" ] || { echo "checksum mismatch for ${name}"; exit 1; }
+            tar -xzf "/tmp/${name}.tar.gz" -C /tmp "${name}"
+          done
+
+      - name: Generate SBOM with syft
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: /tmp/syft "$IMAGE_REF" -o spdx-json=/tmp/morty-sbom.spdx.json
+
+      - name: Scan image with grype
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: |
+          /tmp/grype "$IMAGE_REF" -o sarif --file /tmp/grype.sarif
+          /tmp/grype "$IMAGE_REF" -o json --file /tmp/grype.json --fail-on critical
+
+      - name: Upload grype SARIF
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@88585263c0627ee42c0e1c5143a112c8d6f4aa18 # v4.38.2
+        with:
+          sarif_file: /tmp/grype.sarif
+          category: grype
+
+      - name: Generate OpenVEX document
+        if: github.event_name != 'pull_request'
+        env:
+          VEX_ID: https://github.com/${{ github.repository }}/openvex/${{ github.sha }}
+          VEX_PRODUCT: pkg:oci/morty-xng@${{ steps.build.outputs.digest }}?repository_url=ghcr.io/sudo-ivan
+        run: |
+          jq -n \
+            --arg id "$VEX_ID" \
+            --arg prod "$VEX_PRODUCT" \
+            --slurpfile report /tmp/grype.json '{
+              "@context": "https://openvex.dev/ns/v0.2.0",
+              "@id": $id,
+              "author": "morty-xng ci",
+              "timestamp": (now | todate),
+              "version": 1,
+              "statements": [
+                $report[0].matches[] | {
+                  vulnerability: { name: .vulnerability.id },
+                  products: [ { "@id": $prod } ],
+                  status: "under_investigation"
+                }
+              ]
+            }' > /tmp/openvex.json
+          jq '.statements | length' /tmp/openvex.json
+
+      - name: Attest SBOM and OpenVEX
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign attest --yes --predicate /tmp/morty-sbom.spdx.json \
+            --type https://spdx.dev/Document "$IMAGE_REF"
+          cosign attest --yes --predicate /tmp/openvex.json \
+            --type https://openvex.dev/ns/v0.2.0 "$IMAGE_REF"
+
+      - name: Upload scan artifacts
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: morty-${{ github.ref_name }}-supply-chain
+          path: |
+            /tmp/morty-sbom.spdx.json
+            /tmp/grype.sarif
+            /tmp/openvex.json
+          retention-days: 90

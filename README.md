@@ -135,6 +135,29 @@ Entries marked `[fork change]` do not exist upstream:
   extending the timestamp invalidates the link.
 
 
+### Supply chain verification
+
+`[fork change]`
+
+Published images are signed with cosign keyless signing, carry SBOM and
+OpenVEX attestations, and are scanned with grype (critical findings fail
+the build):
+
+```
+$ cosign verify ghcr.io/sudo-ivan/morty-xng:v0.4.2 \
+    --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp="https://github.com/Sudo-Ivan/morty-xng"
+$ cosign verify-attestation --type https://spdx.dev/Document \
+    ghcr.io/sudo-ivan/morty-xng:v0.4.2 \
+    --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp="https://github.com/Sudo-Ivan/morty-xng"
+$ cosign verify-attestation --type https://openvex.dev/ns/v0.2.0 \
+    ghcr.io/sudo-ivan/morty-xng:v0.4.2 \
+    --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp="https://github.com/Sudo-Ivan/morty-xng"
+```
+
+
 ### SearXNG integration
 
 `[fork change: rewritten, documents the 2025-05-13 result_proxy removal]`

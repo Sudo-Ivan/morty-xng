@@ -1,3 +1,19 @@
+# v0.4.2 - 2026.09.28
+
+Supply-chain hardening for the container image.
+
+- fix: dropped the wget package (busybox applet covers the healthcheck),
+  removing 4 known-vulnerable CVEs from the image; remaining base image
+  findings have no published fixes yet
+- new: cosign keyless signing of the published image digest
+- new: syft-generated SPDX SBOM and grype vulnerability scan on every
+  published image, SARIF uploaded to code scanning, critical findings
+  fail the build
+- new: OpenVEX document generated per image from grype results and
+  attested via cosign alongside the SBOM
+- fix: OCI image labels now point at this repository, with vendor,
+  documentation, version and revision labels
+
 # v0.4.1 - 2026.09.28
 
 Bug fixes found by a new adversarial test suite, plus performance work.

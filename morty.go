@@ -32,7 +32,7 @@ import (
 	"github.com/asciimoo/morty/contenttype"
 )
 
-const version = "v0.4.1"
+const version = "v0.4.2"
 
 const maxRedirectCount = 5
 
