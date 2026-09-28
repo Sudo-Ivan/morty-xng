@@ -17,6 +17,8 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write # needed to create the GitHub release and upload assets
+      attestations: write # needed for build provenance attestation
+      id-token: write # needed for attestation signing
     steps:
       - name: Harden the runner
         uses: step-security/harden-runner@5c7944e73c4c2a096b17a9cb74d65b6c2bbafbde # v2.9.1
@@ -53,6 +55,11 @@ jobs:
           done
           cd dist
           sha256sum -- * > "morty-${tag}-sha256sums.txt"
+
+      - name: Attest binaries
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/morty-*
 
       - name: Publish release
         env:
