@@ -1,3 +1,33 @@
+# v0.4.0 - 2026.09.28
+
+Hardening and feature release.
+
+- fix: upstream responses are requested with Accept-Encoding identity and
+  compressed bodies are decompressed, previously they corrupted the output
+- fix: private and reserved upstream IPs are refused at dial time (SSRF
+  protection), override with -allowprivate / MORTY_ALLOWPRIVATE
+- fix: CSS @import string form and image-set()/ -webkit-image-set() quoted
+  entries are proxified instead of leaking direct fetches
+- fix: formaction, poster, cite, background, longdesc and usemap attributes
+  are proxified; iframe srcdoc is sanitized recursively
+- new: signed link expiry via -keyttl / MORTY_KEYTTL and the mortyexp
+  parameter, expiry stripping and timestamp tampering are rejected
+- new: per-client-IP rate limiting for keyless mode, -ratelimit /
+  MORTY_RATELIMIT (default 60/min)
+- new: host allowlist and denylist, -allow / -deny, applied to every
+  redirect hop
+- new: /metrics endpoint in Prometheus format via -metrics / MORTY_METRICS
+- new: opt-in in-memory LRU response cache for static content, -cache /
+  -cachettl
+- new: configurable upstream User-Agent via -ua / MORTY_UA
+- new: upstream keep-alive and 60s DNS caching (connection close per
+  request removed)
+- new: structured logging via log/slog
+- new: fuzz targets for the sanitizer, proxifier and content-type parser
+  with a fuzz.yml CI job, plus CodeQL analysis
+- ci: container builds publish SBOM and provenance attestations, release
+  binaries are attested via actions/attest-build-provenance
+
 # v0.3.0 - 2026.09.28
 
 Modernization release.
