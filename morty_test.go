@@ -2,13 +2,17 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -232,30 +236,59 @@ func TestURLProxifierWithKey(t *testing.T) {
 	if mortyURL != "http://x.com/a?b=1" {
 		t.Fatalf("unexpected mortyurl: %s", mortyURL)
 	}
-	if !verifyRequestURI([]byte(mortyURL), []byte(mortyHash), key) {
+	if !verifySignedURI([]byte(mortyURL), []byte(mortyHash), nil, key, 0) {
 		t.Fatal("mortyhash does not verify")
 	}
 }
 
-func TestVerifyRequestURI(t *testing.T) {
+func TestVerifySignedURI(t *testing.T) {
 	key := []byte("test-key")
 	uri := []byte("https://example.com/path?q=1")
 	validHash := []byte(hash(string(uri), key))
 
-	if !verifyRequestURI(uri, validHash, key) {
+	if !verifySignedURI(uri, validHash, nil, key, 0) {
 		t.Error("valid HMAC rejected")
 	}
-	if verifyRequestURI(uri, []byte("deadbeef"), key) {
+	if verifySignedURI(uri, []byte("deadbeef"), nil, key, 0) {
 		t.Error("invalid HMAC accepted")
 	}
-	if verifyRequestURI(uri, nil, key) {
+	if verifySignedURI(uri, nil, nil, key, 0) {
 		t.Error("missing HMAC accepted")
 	}
-	if verifyRequestURI([]byte("https://other.example/"), validHash, key) {
+	if verifySignedURI([]byte("https://other.example/"), validHash, nil, key, 0) {
 		t.Error("HMAC for a different URL accepted")
 	}
-	if verifyRequestURI(uri, []byte("not-hex!!"), key) {
+	if verifySignedURI(uri, []byte("not-hex!!"), nil, key, 0) {
 		t.Error("non-hex HMAC accepted")
+	}
+}
+
+func TestVerifySignedURIWithExpiry(t *testing.T) {
+	key := []byte("test-key")
+	uri := "https://example.com/x"
+
+	h, exp := signURL(uri, key, 300)
+	if !verifySignedURI([]byte(uri), []byte(h), []byte(exp), key, 300) {
+		t.Error("fresh signed URL with expiry rejected")
+	}
+	// missing exp must fail when ttl is configured
+	hNoExp := hash(uri, key)
+	if verifySignedURI([]byte(uri), []byte(hNoExp), nil, key, 300) {
+		t.Error("URL without mortyexp accepted when ttl configured")
+	}
+	// stripping mortyexp from a signed URL must fail
+	if verifySignedURI([]byte(uri), []byte(h), nil, key, 300) {
+		t.Error("expiry stripping accepted")
+	}
+	// tampering with the expiry timestamp must fail
+	if verifySignedURI([]byte(uri), []byte(h), []byte("9999999999"), key, 300) {
+		t.Error("tampered mortyexp accepted")
+	}
+	// an already expired timestamp must fail even with a valid hmac
+	expired := time.Now().Add(-time.Hour).Unix()
+	hExpired := hash(fmt.Sprintf("%s|%d", uri, expired), key)
+	if verifySignedURI([]byte(uri), []byte(hExpired), []byte(strconv.FormatInt(expired, 10)), key, 300) {
+		t.Error("expired mortyexp accepted")
 	}
 }
 
@@ -441,6 +474,27 @@ var sanitizeHTMLCases = []sanitizeHTMLCase{
 		mustContain: []string{"<p>ok</p>"},
 		mustNot:     []string{"<script", "<math"},
 	},
+	{
+		name:        "formaction proxified",
+		input:       `<html><body><form><button formaction="/submit">go</button></form></body></html>`,
+		mustContain: []string{`formaction="./?mortyurl=http%3A%2F%2Fbase.example%2Fsubmit"`},
+	},
+	{
+		name:        "poster and cite proxified",
+		input:       `<html><body><video poster="/p.png"></video><blockquote cite="/q"></blockquote></body></html>`,
+		mustContain: []string{`poster="./?mortyurl=http%3A%2F%2Fbase.example%2Fp.png"`, `cite="./?mortyurl=http%3A%2F%2Fbase.example%2Fq"`},
+	},
+	{
+		name:        "srcdoc sanitized recursively",
+		input:       `<html><body><iframe srcdoc="&lt;script&gt;x()&lt;/script&gt;&lt;p&gt;ok&lt;/p&gt;"></iframe></body></html>`,
+		mustContain: []string{`srcdoc="`},
+		mustNot:     []string{"script&gt;x"},
+	},
+	{
+		name:        "srcset proxified",
+		input:       `<html><body><img srcset="/a.png 1x, /b.png 2x"></body></html>`,
+		mustContain: []string{`srcset="`, `mortyurl=http%3A%2F%2Fbase.example%2Fa.png`, `mortyurl=http%3A%2F%2Fbase.example%2Fb.png`},
+	},
 }
 
 func TestSanitizeHTML(t *testing.T) {
@@ -489,6 +543,39 @@ func TestSanitizeCSS(t *testing.T) {
 	}
 	if !strings.Contains(got, "data:image/png;base64,AAAA") {
 		t.Errorf("safe data uri removed: %s", got)
+	}
+}
+
+func TestSanitizeCSSImport(t *testing.T) {
+	u, _ := url.Parse("http://base.example/css/")
+	rc := &RequestConfig{BaseURL: u}
+	for _, input := range []string{
+		`@import "other.css"; body{color:red}`,
+		`@import 'sub/dir.css';`,
+		`@IMPORT  "up.css";`,
+	} {
+		out := bytes.NewBuffer(nil)
+		sanitizeCSS(rc, out, []byte(input))
+		got := out.String()
+		if !strings.Contains(got, "mortyurl=") {
+			t.Errorf("css @import not proxified: %q -> %q", input, got)
+		}
+	}
+}
+
+func TestSanitizeCSSImageSet(t *testing.T) {
+	u, _ := url.Parse("http://base.example/css/")
+	rc := &RequestConfig{BaseURL: u}
+	out := bytes.NewBuffer(nil)
+	sanitizeCSS(rc, out, []byte(`a { background: image-set("a.png" 1x, 'b.png' 2x); } c { background: -webkit-image-set("c.png" 1x); }`))
+	got := out.String()
+	if strings.Count(got, "mortyurl=") != 3 {
+		t.Errorf("expected 3 proxified image-set urls, got: %s", got)
+	}
+	for _, leaked := range []string{`"a.png"`, `'b.png'`, `"c.png"`} {
+		if strings.Contains(got, leaked) {
+			t.Errorf("image-set leaked raw url %s: %s", leaked, got)
+		}
 	}
 }
 
@@ -689,5 +776,252 @@ func BenchmarkSanitizeComplexHTML(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		out.Reset()
 		sanitizeHTML(rc, out, benchComplexHTML)
+	}
+}
+
+func TestIsPrivateIP(t *testing.T) {
+	for _, private := range []string{
+		"127.0.0.1", "10.1.2.3", "172.16.5.4", "192.168.1.1",
+		"169.254.169.254", "0.0.0.0", "100.64.1.1", "224.0.0.1",
+		"::1", "fc00::1", "fe80::1", "::ffff:127.0.0.1",
+	} {
+		ip := mustParseAddr(t, private)
+		if !isPrivateIP(ip) {
+			t.Errorf("%s must be classified as private", private)
+		}
+	}
+	for _, public := range []string{"1.1.1.1", "8.8.8.8", "2606:4700:4700::1111", "93.184.216.34"} {
+		ip := mustParseAddr(t, public)
+		if isPrivateIP(ip) {
+			t.Errorf("%s must not be classified as private", public)
+		}
+	}
+}
+
+func mustParseAddr(t *testing.T, s string) netip.Addr {
+	t.Helper()
+	ip, err := netip.ParseAddr(s)
+	if err != nil {
+		t.Fatalf("bad test ip %s: %v", s, err)
+	}
+	return ip
+}
+
+func TestSecureDialerBlocksPrivate(t *testing.T) {
+	dial := secureDialer(true, false, newDNSCache(time.Minute), 2*time.Second)
+	for _, target := range []string{"127.0.0.1:9", "169.254.169.254:80", "localhost:9"} {
+		conn, err := dial(target)
+		if err == nil {
+			conn.Close() //nolint:errcheck
+			t.Errorf("%s must be blocked", target)
+			continue
+		}
+		if !strings.Contains(err.Error(), "forbidden") {
+			t.Errorf("%s: expected forbidden error, got %v", target, err)
+		}
+	}
+
+	// allowPrivate permits dialing (connection may fail for other reasons,
+	// but must not fail with the forbidden error)
+	openDial := secureDialer(true, true, newDNSCache(time.Minute), 500*time.Millisecond)
+	_, err := openDial("127.0.0.1:9")
+	if err != nil && strings.Contains(err.Error(), "forbidden") {
+		t.Errorf("allowprivate must permit private dials, got %v", err)
+	}
+}
+
+func TestHostAllowed(t *testing.T) {
+	deny := []string{"evil.com", "tracker.io"}
+	allow := []string{"good.org"}
+	if hostAllowed("sub.evil.com", nil, deny) {
+		t.Error("deny suffix match failed")
+	}
+	if hostAllowed("evil.com", nil, deny) {
+		t.Error("deny exact match failed")
+	}
+	if !hostAllowed("good.org", nil, deny) {
+		t.Error("unrelated host must pass denylist")
+	}
+	if !hostAllowed("cdn.good.org", allow, deny) {
+		t.Error("allow suffix match failed")
+	}
+	if hostAllowed("other.org", allow, nil) {
+		t.Error("non-allowlisted host must be rejected when allowlist set")
+	}
+	if hostAllowed("good.org.evil.com", allow, nil) {
+		t.Error("suffix confusion must not pass")
+	}
+}
+
+func TestSplitHostList(t *testing.T) {
+	got := splitHostList(" a.com ,B.COM,, c.org ")
+	want := []string{"a.com", "b.com", "c.org"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %v want %v", got, want)
+		}
+	}
+	if splitHostList("") != nil {
+		t.Error("empty list must return nil")
+	}
+}
+
+func TestRateLimiter(t *testing.T) {
+	l := newRateLimiter(2)
+	first := l.allow("1.2.3.4")
+	second := l.allow("1.2.3.4")
+	if !first || !second {
+		t.Fatal("burst exhausted too early")
+	}
+	if l.allow("1.2.3.4") {
+		t.Fatal("rate limit not enforced")
+	}
+	if !l.allow("5.6.7.8") {
+		t.Fatal("limiter must be per-IP")
+	}
+}
+
+func TestResponseCache(t *testing.T) {
+	c := newResponseCache(1024, time.Minute)
+	c.put("k", []byte("body"), "image/png", nil)
+	e := c.get("k")
+	if e == nil || string(e.body) != "body" || e.contentType != "image/png" {
+		t.Fatal("cache get failed")
+	}
+	if c.get("missing") != nil {
+		t.Fatal("missing key hit")
+	}
+	// oversized entries are dropped
+	c.put("big", make([]byte, 2048), "image/png", nil)
+	if c.get("big") != nil {
+		t.Fatal("oversized entry cached")
+	}
+	// eviction respects the byte cap
+	c.put("a", make([]byte, 512), "x", nil)
+	c.put("b", make([]byte, 512), "x", nil)
+	c.put("d", make([]byte, 512), "x", nil)
+	if c.get("a") != nil && c.get("d") == nil {
+		t.Fatal("LRU eviction order wrong")
+	}
+	// expiry
+	c2 := newResponseCache(1024, -time.Second)
+	c2.put("x", []byte("y"), "x", nil)
+	if c2.get("x") != nil {
+		t.Fatal("expired entry returned")
+	}
+}
+
+func TestProxyGzipUpstream(t *testing.T) {
+	var raw bytes.Buffer
+	gz := gzip.NewWriter(&raw)
+	gz.Write([]byte(`<html><body><p>gzipped</p></body></html>`)) //nolint:errcheck
+	gz.Close()                                                   //nolint:errcheck
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(raw.Bytes()) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	p := &Proxy{RequestTimeout: 5 * time.Second}
+	base := startProxy(t, p)
+	status, _, body := httpGet(t, base+"/?mortyurl="+url.QueryEscape(upstream.URL+"/"))
+	if status != 200 {
+		t.Fatalf("status=%d", status)
+	}
+	if !strings.Contains(body, "gzipped") {
+		t.Fatalf("gzip body not decompressed: %s", body[:200])
+	}
+}
+
+func TestProxyCache(t *testing.T) {
+	var hits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte("png-bytes")) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	p := &Proxy{RequestTimeout: 5 * time.Second, Cache: newResponseCache(1<<20, time.Minute)}
+	base := startProxy(t, p)
+	u := base + "/?mortyurl=" + url.QueryEscape(upstream.URL+"/i.png")
+	for i := 0; i < 2; i++ {
+		status, _, body := httpGet(t, u)
+		if status != 200 || !strings.Contains(body, "png-bytes") {
+			t.Fatalf("request %d failed: %d", i, status)
+		}
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("expected 1 upstream fetch, got %d", hits.Load())
+	}
+}
+
+func TestProxyRateLimit(t *testing.T) {
+	p := &Proxy{RequestTimeout: 5 * time.Second, RateLimiter: newRateLimiter(1)}
+	base := startProxy(t, p)
+	status, _, _ := httpGet(t, base+"/")
+	if status != 200 {
+		t.Fatalf("first request failed: %d", status)
+	}
+	status, _, _ = httpGet(t, base+"/")
+	if status != 429 {
+		t.Fatalf("expected 429, got %d", status)
+	}
+}
+
+func TestProxyMetrics(t *testing.T) {
+	m := newMetrics(newResponseCache(1024, time.Minute))
+	p := &Proxy{RequestTimeout: 5 * time.Second, Metrics: m}
+	base := startProxy(t, p)
+	httpGet(t, base+"/")
+	status, _, body := httpGet(t, base+"/metrics")
+	if status != 200 {
+		t.Fatalf("metrics: %d", status)
+	}
+	for _, want := range []string{"morty_requests_total", "morty_denied_requests_total", "morty_uptime_seconds", "morty_cache_hits_total"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output missing %s", want)
+		}
+	}
+}
+
+func TestProxyHostDeny(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+	host := strings.TrimPrefix(upstream.URL, "http://")
+
+	p := &Proxy{RequestTimeout: 5 * time.Second, DenyHosts: []string{"127.0.0.1"}}
+	base := startProxy(t, p)
+	status, _, _ := httpGet(t, base+"/?mortyurl="+url.QueryEscape("http://"+host+"/"))
+	if status != 403 {
+		t.Fatalf("denied host: expected 403, got %d", status)
+	}
+
+	p2 := &Proxy{RequestTimeout: 5 * time.Second, AllowHosts: []string{"example.com"}}
+	base2 := startProxy(t, p2)
+	status, _, _ = httpGet(t, base2+"/?mortyurl="+url.QueryEscape("http://"+host+"/"))
+	if status != 403 {
+		t.Fatalf("non-allowlisted host: expected 403, got %d", status)
+	}
+}
+
+func TestProxySSRFBlocked(t *testing.T) {
+	// wire the secure dialer to prove private targets cannot be fetched
+	oldDial := client.Dial
+	client.Dial = secureDialer(true, false, newDNSCache(time.Minute), 2*time.Second)
+	defer func() { client.Dial = oldDial }()
+
+	p := &Proxy{RequestTimeout: 5 * time.Second}
+	base := startProxy(t, p)
+	status, _, _ := httpGet(t, base+"/?mortyurl="+url.QueryEscape("http://127.0.0.1:1/"))
+	if status != 500 {
+		t.Fatalf("private upstream: expected 500, got %d", status)
 	}
 }
