@@ -1,0 +1,11 @@
+.git
+.github
+.dockerignore
+Dockerfile
+Makefile
+README.md
+CHANGELOG.md
+LICENSE
+morty
+morty.1
+*.test
