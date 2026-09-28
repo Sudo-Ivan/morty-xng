@@ -12,9 +12,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
-
 jobs:
   image:
     name: Build container image
@@ -62,12 +59,19 @@ jobs:
           docker logs morty
           docker stop morty
 
+      - name: Compute lowercase image name
+        if: github.event_name != 'pull_request'
+        id: img
+        env:
+          REPO: ${{ github.repository }}
+        run: echo "name=$(echo "ghcr.io/$REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - name: Extract image metadata
         if: github.event_name != 'pull_request'
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ steps.img.outputs.name }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -96,12 +100,19 @@ jobs:
           platforms: linux/amd64,linux/arm64
           sbom: true
           provenance: mode=max
+          compression: zstd
+          compression-level: 19
+          force-compression: true
+          oci-mediatypes: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
 
       - name: Attest image
         if: github.event_name != 'pull_request'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-name: ${{ env.IMAGE_NAME }}
+          subject-name: ${{ steps.img.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
@@ -112,7 +123,7 @@ jobs:
       - name: Sign image (keyless)
         if: github.event_name != 'pull_request'
         env:
-          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          IMAGE_REF: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
         run: cosign sign --yes "$IMAGE_REF"
 
       - name: Install syft and grype
@@ -134,13 +145,13 @@ jobs:
       - name: Generate SBOM with syft
         if: github.event_name != 'pull_request'
         env:
-          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          IMAGE_REF: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
         run: /tmp/syft "$IMAGE_REF" -o spdx-json=/tmp/morty-sbom.spdx.json
 
       - name: Scan image with grype
         if: github.event_name != 'pull_request'
         env:
-          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          IMAGE_REF: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
         run: |
           /tmp/grype "$IMAGE_REF" -o sarif --file /tmp/grype.sarif
           /tmp/grype "$IMAGE_REF" -o json --file /tmp/grype.json --fail-on critical
@@ -180,7 +191,7 @@ jobs:
       - name: Attest SBOM and OpenVEX
         if: github.event_name != 'pull_request'
         env:
-          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          IMAGE_REF: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
         run: |
           cosign attest --yes --predicate /tmp/morty-sbom.spdx.json \
             --type https://spdx.dev/Document "$IMAGE_REF"
