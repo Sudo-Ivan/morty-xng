@@ -158,7 +158,7 @@ func TestAttrSanitizer(t *testing.T) {
 	rc := &RequestConfig{BaseURL: u}
 	for _, testCase := range attrTestData {
 		out := bytes.NewBuffer(nil)
-		sanitizeAttr(rc, out, testCase.attrName, testCase.attrValue, testCase.attrValue)
+		sanitizeAttr(rc, out, testCase.attrName, testCase.attrValue)
 		res, _ := out.ReadBytes(byte(0))
 		if !bytes.Equal(res, testCase.expectedOutput) {
 			t.Errorf(

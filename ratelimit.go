@@ -21,8 +21,12 @@ type visitor struct {
 }
 
 // newRateLimiter creates a limiter allowing perMinute requests per minute
-// per client IP with a burst of the same size.
+// per client IP with a burst of the same size. A zero limit disables
+// limiting and returns nil.
 func newRateLimiter(perMinute uint) *rateLimiter {
+	if perMinute == 0 {
+		return nil
+	}
 	return &rateLimiter{
 		rate:     float64(perMinute) / 60.0,
 		burst:    float64(perMinute),

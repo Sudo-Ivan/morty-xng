@@ -141,6 +141,9 @@ func secureDialer(ipv6, allowPrivate bool, dns *dnsCache, dialTimeout time.Durat
 		if blocked > 0 {
 			return nil, fmt.Errorf("%w: %s (dial failed: %v)", errForbiddenAddress, host, lastErr)
 		}
+		if lastErr == nil {
+			return nil, fmt.Errorf("no usable address for %s", host)
+		}
 		return nil, fmt.Errorf("cannot dial %s: %w", host, lastErr)
 	}
 }

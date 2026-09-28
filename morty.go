@@ -32,13 +32,20 @@ import (
 	"github.com/asciimoo/morty/contenttype"
 )
 
-const version = "v0.4.0"
+const version = "v0.4.1"
 
 const maxRedirectCount = 5
 
+// maxBodySize caps the compressed upstream response on the wire and
+// maxUncompressedBodySize caps it after decompression to stop bombs.
+const (
+	maxBodySize             = 10 * 1024 * 1024 // 10M
+	maxUncompressedBodySize = 64 * 1024 * 1024 // 64M
+)
+
 var client = &fasthttp.Client{
-	MaxResponseBodySize: 10 * 1024 * 1024, // 10M
-	ReadBufferSize:      16 * 1024,        // 16K
+	MaxResponseBodySize: maxBodySize,
+	ReadBufferSize:      16 * 1024, // 16K
 	MaxIdleConnDuration: 90 * time.Second,
 }
 
@@ -127,7 +134,11 @@ type Proxy struct {
 
 // requestConfig builds the sanitizer config for one proxified document.
 func (p *Proxy) requestConfig(baseURL *url.URL) *RequestConfig {
-	return &RequestConfig{Key: p.Key, KeyTTL: p.KeyTTL, BaseURL: baseURL}
+	rc := &RequestConfig{Key: p.Key, KeyTTL: p.KeyTTL, BaseURL: baseURL}
+	if p.Key != nil {
+		rc.signer = newHMACSHA256(p.Key)
+	}
+	return rc
 }
 
 // setSecurityHeaders adds headers applied to every response.
@@ -176,12 +187,15 @@ func (p *Proxy) RequestHandler(ctx *fasthttp.RequestCtx) {
 
 	requestURIQuery := ctx.QueryArgs().QueryString()
 	if len(requestURIQuery) > 0 {
-		if bytes.ContainsRune(requestURI, '?') {
-			requestURI = append(requestURI, '&')
+		// requestURI aliases the args buffer, so a copy is required
+		// before appending
+		merged := append([]byte(nil), requestURI...)
+		if bytes.ContainsRune(merged, '?') {
+			merged = append(merged, '&')
 		} else {
-			requestURI = append(requestURI, '?')
+			merged = append(merged, '?')
 		}
-		requestURI = append(requestURI, requestURIQuery...)
+		requestURI = append(merged, requestURIQuery...)
 	}
 
 	p.ProcessURI(ctx, string(requestURI), 0)
@@ -204,8 +218,9 @@ func (p *Proxy) ProcessURI(ctx *fasthttp.RequestCtx, requestURIStr string, redir
 		}
 	}
 
-	// Serve an intermediate page for protocols other than HTTP(S)
-	if (parsedURI.Scheme != "http" && parsedURI.Scheme != "https") || strings.HasSuffix(parsedURI.Host, ".onion") {
+	// Serve an intermediate page for protocols other than HTTP(S).
+	// Hostname() is used so a port suffix cannot bypass the onion check.
+	if (parsedURI.Scheme != "http" && parsedURI.Scheme != "https") || strings.HasSuffix(parsedURI.Hostname(), ".onion") {
 		p.serveExitMortyPage(ctx, parsedURI)
 		return
 	}
@@ -356,8 +371,9 @@ func (p *Proxy) ProcessURI(ctx *fasthttp.RequestCtx, requestURIStr string, redir
 		contentType.Suffix = ""
 	}
 
-	// decompress upstream body when the server ignored our identity request
-	upstreamBody, err := resp.BodyUncompressed()
+	// decompress upstream body when the server ignored our identity
+	// request, with a hard cap on the decompressed size
+	upstreamBody, err := resp.BodyUncompressedWithLimit(maxUncompressedBodySize)
 	if err != nil {
 		p.serveMainPage(ctx, fasthttp.StatusServiceUnavailable, err)
 		return

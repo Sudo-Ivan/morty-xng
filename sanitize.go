@@ -2,13 +2,17 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"html/template"
 	"io"
 	"log/slog"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/net/html"
@@ -141,11 +145,106 @@ var cssImageSetRegexp = regexp.MustCompile(`(?i)(-webkit-)?image-set\(([^)]*)\)`
 // cssQuotedRegexp matches a single quoted string used inside image-set().
 var cssQuotedRegexp = regexp.MustCompile(`(['"])([^'"]*)['"]`)
 
+// cssForbiddenRegexp matches legacy CSS code-execution vectors that cannot
+// be proxified away: IE expression(), behavior/binding script bindings and
+// javascript:/vbscript: URLs. Any hit drops the whole declaration block.
+var cssForbiddenRegexp = regexp.MustCompile(`(?i)expression\s*\(|behavior\s*:|-moz-binding|binding\s*:|javascript\s*:|vbscript\s*:`)
+
 type RequestConfig struct {
 	Key          []byte
 	KeyTTL       int64
 	BaseURL      *url.URL
 	BodyInjected bool
+	signer       *hmacSHA256
+}
+
+// hmacSHA256 holds precomputed HMAC-SHA256 key pads so signing each
+// proxified link does not rebuild them.
+type hmacSHA256 struct {
+	ipad [64]byte
+	opad [64]byte
+}
+
+func newHMACSHA256(key []byte) *hmacSHA256 {
+	h := &hmacSHA256{}
+	var kb [64]byte
+	if len(key) > 64 {
+		sum := sha256.Sum256(key)
+		copy(kb[:], sum[:])
+	} else {
+		copy(kb[:], key)
+	}
+	for i := range kb {
+		h.ipad[i] = kb[i] ^ 0x36
+		h.opad[i] = kb[i] ^ 0x5c
+	}
+	return h
+}
+
+func (h *hmacSHA256) sum(msg []byte) []byte {
+	inner := sha256.New()
+	inner.Write(h.ipad[:])
+	inner.Write(msg)
+	in := inner.Sum(nil)
+	outer := sha256.New()
+	outer.Write(h.opad[:])
+	outer.Write(in)
+	return outer.Sum(nil)
+}
+
+// hmacString signs msg with the request key, building the precomputed
+// pads lazily on first use. RequestConfig is per-request and not shared
+// between goroutines, so the lazy init is race free.
+func (rc *RequestConfig) hmacString(msg string) string {
+	if rc.signer == nil {
+		if rc.Key == nil {
+			return ""
+		}
+		rc.signer = newHMACSHA256(rc.Key)
+	}
+	return hex.EncodeToString(rc.signer.sum([]byte(msg)))
+}
+
+// sign produces the mortyhash and optional mortyexp for a signed link.
+func (rc *RequestConfig) sign(msg string) (string, string) {
+	if rc.KeyTTL > 0 {
+		exp := time.Now().Add(time.Duration(rc.KeyTTL) * time.Second).Unix()
+		return rc.hmacString(fmt.Sprintf("%s|%d", msg, exp)), strconv.FormatInt(exp, 10)
+	}
+	return rc.hmacString(msg), ""
+}
+
+// htmlAttr is a raw attribute name/value pair from the tokenizer.
+type htmlAttr struct {
+	name  []byte
+	value []byte
+}
+
+// writeEscaped writes b escaping the same characters as html.EscapeString:
+// & " ' < >
+func writeEscaped(out io.Writer, b []byte) {
+	last := 0
+	for i, c := range b {
+		var rep string
+		switch c {
+		case '&':
+			rep = "&amp;"
+		case '"':
+			rep = "&#34;"
+		case '\'':
+			rep = "&#39;"
+		case '<':
+			rep = "&lt;"
+		case '>':
+			rep = "&gt;"
+		default:
+			continue
+		}
+		out.Write(b[last:i])
+		io.WriteString(out, rep)
+		last = i + 1
+	}
+	out.Write(b[last:])
 }
 
 type htmlBodyExtParam struct {
@@ -236,6 +335,12 @@ input[type=checkbox]#mortytoggle:checked ~ div { display: none; visibility: hidd
 }
 
 func sanitizeCSS(rc *RequestConfig, out io.Writer, css []byte) {
+	// drop stylesheets carrying script-execution vectors outright
+	if cssForbiddenRegexp.Match(css) {
+		slog.Debug("css dropped: forbidden construct")
+		return
+	}
+
 	// rewrite @import "..." and image-set("...") string forms first;
 	// url(...) is handled afterwards by cssURLRegexp
 	css = rewriteCSSQuoted(rc, css, cssImportRegexp)
@@ -353,34 +458,48 @@ func sanitizeHTML(rc *RequestConfig, out io.Writer, htmlDoc []byte) {
 					state = stateInNoscript
 					break
 				}
-				var attrs [][][]byte
+
+				if bytes.Equal(tag, []byte("link")) || bytes.Equal(tag, []byte("meta")) {
+					var attrs []htmlAttr
+					if hasAttrs {
+						for {
+							attrName, attrValue, moreAttr := decoder.TagAttr()
+							attrs = append(attrs, htmlAttr{attrName, attrValue})
+							if !moreAttr {
+								break
+							}
+						}
+					}
+					if bytes.Equal(tag, []byte("link")) {
+						sanitizeLinkTag(rc, out, attrs)
+					} else {
+						sanitizeMetaTag(rc, out, attrs)
+					}
+					break
+				}
+
+				out.Write([]byte{'<'})
+				out.Write(tag)
+
+				// the form action is captured while streaming attributes
+				// so the hidden inputs below point at the right target
+				var formURL *url.URL
+				if bytes.Equal(tag, []byte("form")) {
+					formURL = rc.BaseURL
+				}
 				if hasAttrs {
 					for {
 						attrName, attrValue, moreAttr := decoder.TagAttr()
-						attrs = append(attrs, [][]byte{
-							attrName,
-							attrValue,
-							[]byte(html.EscapeString(string(attrValue))),
-						})
+						if formURL != nil && bytes.Equal(attrName, []byte("action")) {
+							if parsed, err := rc.BaseURL.Parse(string(attrValue)); err == nil {
+								formURL = parsed
+							}
+						}
+						sanitizeAttr(rc, out, attrName, attrValue)
 						if !moreAttr {
 							break
 						}
 					}
-				}
-				if bytes.Equal(tag, []byte("link")) {
-					sanitizeLinkTag(rc, out, attrs)
-					break
-				}
-
-				if bytes.Equal(tag, []byte("meta")) {
-					sanitizeMetaTag(rc, out, attrs)
-					break
-				}
-
-				fmt.Fprintf(out, "<%s", tag)
-
-				if hasAttrs {
-					sanitizeAttrs(rc, out, attrs)
 				}
 
 				if token == html.SelfClosingTagToken {
@@ -396,20 +515,11 @@ func sanitizeHTML(rc *RequestConfig, out io.Writer, htmlDoc []byte) {
 					io.WriteString(out, htmlHeadContentType)
 				}
 
-				if bytes.Equal(tag, []byte("form")) {
-					formURL := rc.BaseURL
-					for _, attr := range attrs {
-						if bytes.Equal(attr[0], []byte("action")) {
-							if parsed, err := rc.BaseURL.Parse(string(attr[1])); err == nil {
-								formURL = parsed
-							}
-							break
-						}
-					}
+				if formURL != nil {
 					urlStr := formURL.String()
 					var key, exp string
 					if rc.Key != nil {
-						key, exp = signURL(urlStr, rc.Key, rc.KeyTTL)
+						key, exp = rc.sign(urlStr)
 					}
 					if err := htmlFormExtension.Execute(out, htmlFormExtParam{urlStr, key, exp}); err != nil {
 						slog.Debug("failed to inject form extension", "err", err)
@@ -437,13 +547,15 @@ func sanitizeHTML(rc *RequestConfig, out io.Writer, htmlDoc []byte) {
 				}
 				// skip noscript tags - only the tag, not the content, because javascript is sanitized
 				if writeEndTag {
-					fmt.Fprintf(out, "</%s>", tag)
+					out.Write([]byte("</"))
+					out.Write(tag)
+					out.Write([]byte{'>'})
 				}
 
 			case html.TextToken:
 				switch state {
 				case stateDefault:
-					fmt.Fprintf(out, "%s", decoder.Raw())
+					out.Write(decoder.Raw())
 				case stateInStyle:
 					sanitizeCSS(rc, out, decoder.Raw())
 				case stateInNoscript:
@@ -476,16 +588,14 @@ func sanitizeHTML(rc *RequestConfig, out io.Writer, htmlDoc []byte) {
 	}
 }
 
-func sanitizeLinkTag(rc *RequestConfig, out io.Writer, attrs [][][]byte) {
+func sanitizeLinkTag(rc *RequestConfig, out io.Writer, attrs []htmlAttr) {
 	exclude := false
 	for _, attr := range attrs {
-		attrName := attr[0]
-		attrValue := attr[1]
-		if bytes.Equal(attrName, []byte("rel")) && !inArray(attrValue, linkRelSafeValues) {
+		if bytes.Equal(attr.name, []byte("rel")) && !inArray(attr.value, linkRelSafeValues) {
 			exclude = true
 			break
 		}
-		if bytes.Equal(attrName, []byte("as")) && bytes.Equal(attrValue, []byte("script")) {
+		if bytes.Equal(attr.name, []byte("as")) && bytes.Equal(attr.value, []byte("script")) {
 			exclude = true
 			break
 		}
@@ -494,30 +604,28 @@ func sanitizeLinkTag(rc *RequestConfig, out io.Writer, attrs [][][]byte) {
 	if !exclude {
 		out.Write([]byte("<link"))
 		for _, attr := range attrs {
-			sanitizeAttr(rc, out, attr[0], attr[1], attr[2])
+			sanitizeAttr(rc, out, attr.name, attr.value)
 		}
 		out.Write([]byte(">"))
 	}
 }
 
-func sanitizeMetaTag(rc *RequestConfig, out io.Writer, attrs [][][]byte) {
+func sanitizeMetaTag(rc *RequestConfig, out io.Writer, attrs []htmlAttr) {
 	var httpEquiv []byte
 	var content []byte
 
 	for _, attr := range attrs {
-		attrName := attr[0]
-		attrValue := attr[1]
-		if bytes.Equal(attrName, []byte("http-equiv")) {
-			httpEquiv = bytes.ToLower(attrValue)
+		if bytes.Equal(attr.name, []byte("http-equiv")) {
+			httpEquiv = bytes.ToLower(attr.value)
 			// exclude some <meta http-equiv="..." ..>
 			if !inArray(httpEquiv, linkHTTPEquivSafeValues) {
 				return
 			}
 		}
-		if bytes.Equal(attrName, []byte("content")) {
-			content = attrValue
+		if bytes.Equal(attr.name, []byte("content")) {
+			content = attr.value
 		}
-		if bytes.Equal(attrName, []byte("charset")) {
+		if bytes.Equal(attr.name, []byte("charset")) {
 			// exclude <meta charset="...">
 			return
 		}
@@ -535,32 +643,41 @@ func sanitizeMetaTag(rc *RequestConfig, out io.Writer, attrs [][][]byte) {
 		}
 		// output proxify result
 		if uri, err := rc.ProxifyURI(contentURL); err == nil {
-			fmt.Fprintf(out, ` http-equiv="refresh" content="%surl=%s"`, content[:urlIndex], html.EscapeString(uri))
+			out.Write([]byte(` http-equiv="refresh" content="`))
+			writeEscaped(out, content[:urlIndex])
+			out.Write([]byte("url="))
+			writeEscaped(out, []byte(uri))
+			out.Write([]byte{'"'})
 		}
 	} else {
 		if len(httpEquiv) > 0 {
-			fmt.Fprintf(out, ` http-equiv="%s"`, httpEquiv)
+			out.Write([]byte(` http-equiv="`))
+			writeEscaped(out, httpEquiv)
+			out.Write([]byte{'"'})
 		}
-		sanitizeAttrs(rc, out, attrs)
+		for _, attr := range attrs {
+			sanitizeAttr(rc, out, attr.name, attr.value)
+		}
 	}
 	out.Write([]byte(">"))
 }
 
-func sanitizeAttrs(rc *RequestConfig, out io.Writer, attrs [][][]byte) {
-	for _, attr := range attrs {
-		sanitizeAttr(rc, out, attr[0], attr[1], attr[2])
+func sanitizeAttr(rc *RequestConfig, out io.Writer, attrName, attrValue []byte) {
+	writeAttr := func(value []byte) {
+		out.Write([]byte{' '})
+		out.Write(attrName)
+		out.Write([]byte{'=', '"'})
+		writeEscaped(out, value)
+		out.Write([]byte{'"'})
 	}
-}
-
-func sanitizeAttr(rc *RequestConfig, out io.Writer, attrName, attrValue, escapedAttrValue []byte) {
 	if inArray(attrName, safeAttributes) {
-		fmt.Fprintf(out, " %s=\"%s\"", attrName, escapedAttrValue)
+		writeAttr(attrValue)
 		return
 	}
 	switch string(attrName) {
 	case "src", "href", "action", "formaction", "poster", "cite", "background", "longdesc", "usemap":
 		if uri, err := rc.ProxifyURI(attrValue); err == nil {
-			fmt.Fprintf(out, " %s=\"%s\"", attrName, html.EscapeString(uri))
+			writeAttr([]byte(uri))
 		} else {
 			slog.Debug("cannot proxify uri", "uri", string(attrValue))
 		}
@@ -571,13 +688,13 @@ func sanitizeAttr(rc *RequestConfig, out io.Writer, attrName, attrValue, escaped
 		injected := rc.BodyInjected
 		sanitizeHTML(rc, &buf, []byte(doc))
 		rc.BodyInjected = injected
-		fmt.Fprintf(out, " %s=\"%s\"", attrName, html.EscapeString(buf.String()))
+		writeAttr(buf.Bytes())
 	case "srcset":
-		fmt.Fprintf(out, " %s=\"%s\"", attrName, html.EscapeString(proxifySrcSet(rc, attrValue)))
+		writeAttr([]byte(proxifySrcSet(rc, attrValue)))
 	case "style":
 		cssAttr := bytes.NewBuffer(nil)
 		sanitizeCSS(rc, cssAttr, attrValue)
-		fmt.Fprintf(out, " %s=\"%s\"", attrName, html.EscapeString(cssAttr.String()))
+		writeAttr(cssAttr.Bytes())
 	}
 }
 
@@ -585,26 +702,36 @@ func sanitizeAttr(rc *RequestConfig, out io.Writer, attrName, attrValue, escaped
 // A srcset entry is "url descriptor1, descriptor2" separated by commas.
 func proxifySrcSet(rc *RequestConfig, value []byte) string {
 	var b strings.Builder
-	for i, entry := range bytes.Split(value, []byte(",")) {
+	b.Grow(len(value) + 32)
+	first := true
+	for len(value) > 0 {
+		var entry []byte
+		if i := bytes.IndexByte(value, ','); i >= 0 {
+			entry, value = value[:i], value[i+1:]
+		} else {
+			entry, value = value, nil
+		}
 		entry = bytes.TrimSpace(entry)
 		if len(entry) == 0 {
 			continue
 		}
-		if i > 0 {
+		// split entry into url and trailing descriptors
+		u := entry
+		var rest []byte
+		if i := bytes.IndexAny(entry, " \t\f\r\n"); i >= 0 {
+			u, rest = entry[:i], entry[i:]
+		}
+		if !first {
 			b.WriteString(", ")
 		}
-		parts := bytes.Fields(entry)
-		if len(parts) == 0 {
-			continue
-		}
-		if uri, err := rc.ProxifyURI(parts[0]); err == nil {
+		first = false
+		if uri, err := rc.ProxifyURI(u); err == nil {
 			b.WriteString(uri)
 		} else {
-			b.Write(parts[0])
+			b.Write(u)
 		}
-		for _, descriptor := range parts[1:] {
-			b.WriteByte(' ')
-			b.Write(descriptor)
+		if rest != nil {
+			b.Write(rest)
 		}
 	}
 	return b.String()
@@ -723,14 +850,24 @@ func (rc *RequestConfig) ProxifyURI(uri []byte) (string, error) {
 	// return full URI and fragment (if not empty)
 	mortyURI := u.String()
 
+	var b strings.Builder
+	b.Grow(len(mortyURI) + 96)
+	b.WriteString("./?")
 	if rc.Key == nil {
-		return fmt.Sprintf("./?mortyurl=%s%s", url.QueryEscape(mortyURI), fragment), nil
+		b.WriteString("mortyurl=")
+	} else {
+		h, exp := rc.sign(mortyURI)
+		b.WriteString("mortyhash=")
+		b.WriteString(h)
+		if exp != "" {
+			b.WriteString("&mortyexp=")
+			b.WriteString(exp)
+		}
+		b.WriteString("&mortyurl=")
 	}
-	h, exp := signURL(mortyURI, rc.Key, rc.KeyTTL)
-	if exp != "" {
-		return fmt.Sprintf("./?mortyhash=%s&mortyexp=%s&mortyurl=%s%s", h, exp, url.QueryEscape(mortyURI), fragment), nil
-	}
-	return fmt.Sprintf("./?mortyhash=%s&mortyurl=%s%s", h, url.QueryEscape(mortyURI), fragment), nil
+	b.WriteString(url.QueryEscape(mortyURI))
+	b.WriteString(fragment)
+	return b.String(), nil
 }
 
 func inArray(b []byte, a [][]byte) bool {
