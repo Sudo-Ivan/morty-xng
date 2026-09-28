@@ -42,7 +42,7 @@ func (contenttype *ContentType) Equals(other ContentType) bool {
 }
 
 func (contenttype *ContentType) FilterParameters(parameters map[string]bool) {
-	for k, _ := range contenttype.Parameters {
+	for k := range contenttype.Parameters {
 		if !parameters[k] {
 			delete(contenttype.Parameters, k)
 		}
