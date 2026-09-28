@@ -21,15 +21,14 @@ linters:
       # best-effort writes into response buffers.
       excludes:
         - G104
-
-exclusions:
-  generated: lax
-  presets:
-    - comments
-    - common-false-positives
-    - legacy
-    - std-error-handling
-  paths:
-    - third_party$
-    - builtin$
-    - examples$
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
